@@ -77,8 +77,10 @@ flowchart TD
     C --> D[One container for each environment]
     C --> X[Assemble: check markers and members]
     D --> X --> F[Index and one blob for each group]
-    F --> G[Lint job: select blobs for its hooks]
-    G --> H[Install into an empty prek store]
+    F --> P[Publish: attest the index, push to the registry]
+    P --> G[Lint job: fetch the index and verify its attestation]
+    G --> S[Select and download the blobs its hooks need]
+    S --> H[Install into an empty prek store]
     H --> I[prek finds the environments and builds nothing]
 ```
 
@@ -87,7 +89,7 @@ is a compressed tar of one group: one toolchain, one clone or one
 environment. A blob takes its name from the SHA-256 of its bytes. The
 index names every blob and records the requirements each environment
 answers, so a lint job fetches the blobs its own hooks need, and one
-signature over the index vouches for every blob.
+attestation over the index vouches for every blob.
 
 ## Planning
 
@@ -220,21 +222,97 @@ Every member of every archive must also pass the rules in
 The assembler leaves out a unit that breaks any rule and reports it in
 the index. The lint job then builds that environment itself.
 
+## Publishing
+
+The build workflow publishes a bundle after it has proved it (see
+[Measurements](#measurements)), and from the default branch alone.
+
+The publish job holds the workflow's write permissions: `packages:
+write`, `id-token: write` and `attestations: write`. It checks out
+nothing and runs none of this repository's code. It runs pinned
+actions and a short shell script, in four steps:
+
+1. It downloads the index and the blobs by the artifact ids the build
+   job reported, not by name. The lint jobs that prove a bundle run
+   hook code on their runners, between the build and the publish. A job
+   that replaced an artifact would give it a new id, and the publish job
+   would not fetch it.
+2. It checks that the blobs present are the blobs the index names, and
+   that each hashes to its name.
+3. It attests the index with `actions/attest-build-provenance`. The
+   attestation is a Sigstore bundle whose certificate names this
+   repository, the workflow file and the git ref.
+4. It pushes the index, the attestation and the blobs to the GitHub
+   Container Registry with ORAS, as one OCI artifact.
+
+The tag names what the bundle serves: runner image, architecture and
+prek release, for example `ubuntu24-x86_64-prek0.4.14`. A lint job asks
+for the tag that matches it, and a job that no bundle serves finds no
+tag.
+
+GHCR won over release assets for two reasons. Pushing needs
+`packages: write`, which reaches nothing but the package, where a
+release needs `contents: write`. And a registry addresses a blob by
+its digest, which is the name the index already gives it. One step
+may fall to a person: the organisation's settings decide whether a new
+package is public, and the package's settings page is the one place
+that changes a private one. The publish job tries a pull without a
+token on every run, and warns when it fails. In the fork where this
+was first run, the package was public from its first push.
+
+The registry is transport. The lint job believes nothing it serves:
+the index must carry a valid attestation, and a blob must hash to the
+digest the index gives.
+
 ## Installing
 
-A lint job runs two commands. `select` compares the requirements in the
-job's own configuration, optionally limited to the hooks the job runs,
-with the requirements in the index, and lists the blobs to fetch: the
-matching environments, their clones and their toolchains. `install`
-writes those blobs into the prek store.
+`hookbundles/pull.py` is what a lint job runs, through this repository's
+action (`action.yaml`) or the `pull` command. Its order is the security
+argument:
 
-`hookbundles/install.py` uses the standard library alone, so it runs
-with whatever Python the runner has. It refuses to guess:
+1. Find the bundle by tag. No tag means no bundle serves this job.
+2. Download the index and the attestation.
+3. Verify the attestation with `gh attestation verify`. The index must
+   come from this repository's `build.yaml`, run on `refs/heads/main`,
+   on a GitHub-hosted runner. The attestation travels with the bundle,
+   and the check needs no GitHub API call and no token.
+4. Read the index, and check that it fits the runner.
+5. Select blobs: compare the requirements in the job's own
+   configuration, optionally limited to the hooks the job runs, with
+   the requirements in the index. The selection is the matching
+   environments, their clones and their toolchains. If no environment
+   matches, stop: the bundle has nothing for this job.
+6. Download each selected blob by the digest the index gives, and
+   check it against that digest.
+7. Install.
+
+Before step 3 the code reads nothing from the registry but the
+manifest's list of layers. If verification fails it fetches no blob and
+writes nothing.
+
+A registry token, where a caller gives one, goes to a token endpoint
+on the registry's own host and nowhere else. The code refuses a login
+challenge that names another host, and one that comes from the host a
+blob request redirects to.
+
+The store is `PREK_HOME` where the job sets it, and `~/.cache/prek`
+otherwise: the place prek itself will look. A bundle built for any
+other path does not fit.
+
+The action takes the publisher to be the repository that supplied the
+action's own code. A caller pins the action by commit, and that pin is
+the root of trust: no input changes who must have signed the index.
+The action runs the code as `python3 -I` with a `PATH` of system
+directories, so the checkout under review can supply neither a module
+nor the `python3`,
+`gh` or `zstd` that the installer runs.
+
+`hookbundles/install.py` uses the standard library alone. It refuses
+to guess:
 
 - The bundle must fit. The index records the prek release, the store
   path, the runner image and the architecture of its build. If any
-  differs, the installer writes nothing and exits with status 3, and
-  the job carries on as it would without a bundle.
+  differs, the installer writes nothing.
 - The store must be empty. The installer never merges into a store
   that something else filled. It holds the store's own lock, the one
   prek takes before it changes the store, from that check until the
@@ -250,11 +328,24 @@ and moves each group into place once every blob has passed. If a blob
 breaks a rule, or a move or the record of the install fails, it removes
 what it moved and nothing else: a file some other process put in the
 store stays. It writes the record in staging and publishes it last,
-with a hard link, so the store never holds a part-written record. It
-then exits with status 1.
+with a hard link, so the store never holds a part-written record.
 
-The installer does not establish who made the bundle. That is the
-attestation's job; see [Not built yet](#not-built-yet).
+A bundle never fails a lint job that could have run without it. The
+action reports one of four outcomes and, unless the caller sets
+`required`, succeeds in each:
+
+| Status | Meaning | Exit status of `pull` |
+| --- | --- | --- |
+| `installed` | prek will find the environments | 0 |
+| `not-applicable` | No bundle fits this job | 3 |
+| `unverified` | The index failed verification; error annotation | 4 |
+| `failed` | The fetch or the install went wrong | 1 |
+
+Selecting blobs needs a YAML parser, and the action uses the PyYAML
+that the runner image's `python3` carries. A runner without it gets
+`not-applicable`, as does a job whose runner, prek release or store
+path no bundle serves, and a job whose hooks the bundle has no
+environment for.
 
 ## Threats and controls
 
@@ -267,7 +358,9 @@ attestation's job; see [Not built yet](#not-built-yet).
 | A hook's install code replaces a toolchain or a clone | Toolchains and clones come from the base stage's export, whatever a unit's archive holds | A container escape |
 | A hook's install code tampers with its own environment | None, and none today: the same code builds the same environment on the runner | Each hook repository holds trust for its own hook, as now |
 | An archive writes outside the store | Member rules, applied by the assembler and again by the installer | None known |
-| Someone alters a bundle after its build | A blob's name is its digest; a signature over the index is the next stage | Open until publishing exists |
+| Someone alters a bundle in the registry | The index must carry this repository's attestation; a blob must hash to the digest the index gives | An older, validly signed bundle put back under the tag |
+| Another workflow, branch or fork publishes a bundle | The attestation's certificate must name `build.yaml` on `refs/heads/main` of the publishing repository | Whoever can push to that branch |
+| A job in the build workflow swaps the bundle before publishing | The publish job fetches artifacts by the ids the build job reported, and checks blobs against the index | None known |
 | A bundle for another image misbehaves | The installer checks prek release, path, image and architecture | A runner image update between builds; prek's health check then rebuilds |
 | A moved tag changes what a revision means | The planner builds full commit ids and nothing else | None |
 
@@ -308,6 +401,22 @@ the canonical one.
 The warm job's 52 s includes 6 s to download every blob as one run
 artifact, 592 MiB, where a lint job would fetch the 374 MiB it selects.
 
+Two later runs published the bundle, then fetched it back from the
+registry through the action and linted with it. This is the path a
+lint job in another repository takes:
+
+| Measure | First run | Second run |
+| --- | ---: | ---: |
+| Cold lint in the same run: `prek run` | 65.8 s | 72.8 s |
+| Action: fetch, verify and install | 21 s | 23 s |
+| Of which, install | 6.6 s | 13.2 s |
+| `prek run` after the action | 22 s | 37 s |
+
+The first run fetched blobs one at a time and the second eight at a
+time. The runners varied by more than that change saved: on the same
+bundle, the second run's install took twice as long as the first's and
+its lint two-thirds longer.
+
 A laptop (Docker Desktop, `aarch64`, 14 cores) gave the figures for
 single hooks, which the workflow does not measure:
 
@@ -324,12 +433,14 @@ The mechanism works. With the bundle installed, prek ran all 35 hooks
 of the canonical configuration, reported for each what the cold run
 reported, and built no environment.
 
-The time saved depends on what a job runs. A job that runs the whole
-canonical configuration saves about 40 s of 69 s, before the download.
-A job that runs one hook saves less, and a hook such as
-`gha-workflow-linter`, which spends its time on the network while it
-runs, saves nothing. Repositories that run the hooks under `ci.skip`
-alone, the present default, are in that second group.
+The time saved depends on what a job runs, and on the runner. A job
+that runs the whole canonical configuration from the registry took 43 s
+and 60 s for the action and the lint together, against 66 s and 73 s
+for a cold lint: a saving of 13 s to 23 s. A job that runs one hook
+saves less, and a hook such as `gha-workflow-linter`, which spends its
+time on the network while it runs, saves nothing. Repositories that
+run the hooks under `ci.skip` alone, the present default, are in that
+second group.
 
 Size decides the packaging. One archive of everything would be 592 MiB
 to download and 2.6 GiB to unpack, most of it environments a given job
@@ -347,8 +458,12 @@ Those may matter more than the seconds.
 ## Operating notes
 
 - **prek release.** A bundle serves one prek release, the one in the
-  sandbox image. The reusable linting workflow's default has to move
-  with it; a job on another release gets status 3 and builds cold.
+  sandbox image, and its tag says which. The reusable linting
+  workflow's default has to move with it; a job on another release
+  finds no tag and builds cold.
+- **Package visibility.** If the publish job warns that the package is
+  not public, an organisation owner has to change that, once, in the
+  package's settings.
 - **Runner image.** `bundle.toml` names the image family and
   `sandbox/Dockerfile` must be the same distribution release, so that
   an environment's compiled parts find the C library of their build.
@@ -367,20 +482,17 @@ Those may matter more than the seconds.
 
 ## Not built yet
 
-- **Publishing and signing.** The workflow uploads a bundle as a run
-  artifact. The plan is a separate job that holds `packages: write` and
-  `id-token: write`, runs none of the builder's code, pushes the blobs
-  and the index to a registry, and attests the index. Lint jobs then
-  verify the attestation's signer before they trust the index. The
-  choice between GHCR and a release for the registry is still open.
-- **The lint job's side.** Nothing fetches or installs a bundle outside
-  this repository's own workflow. That needs a step in
-  `standalone-linting-action` or in the reusable linting workflow, and
-  a decision on what a failed verification does: the proposal is to
-  build cold and raise an error annotation on the job.
-- **A schedule.** The workflow runs on a push, a pull request or by
-  hand. A published bundle needs a scheduled build, and a build when
-  `actions-template` changes its hooks.
+- **The lint workflow's side.** The action exists, and this
+  repository's workflow uses it. No lint job elsewhere calls it yet.
+  That needs a step in the reusable linting workflow, before
+  `standalone-linting-action` runs, and that action's own `actions/cache`
+  of the store turned off for the job, since the installer wants an
+  empty store.
+- **Pruning.** Each publish leaves the previous bundle's blobs in the
+  registry, untagged. Nothing removes them yet.
+- **Rebuilding on change.** The workflow builds daily, on a push and by
+  hand. A build when `actions-template` changes its hooks would shorten
+  the wait after a hook moves to a new revision.
 - **Other runners.** The bundle serves `ubuntu24` on `x86_64`. Arm
   runners and other images each need a build of their own.
 - **Egress.** The sandbox job runs harden-runner in audit mode. The

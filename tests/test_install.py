@@ -14,10 +14,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, override
 from unittest import mock
 
-from hookbundles import MANIFEST_NAME, assemble, install, selection, values
-from hookbundles.plan import Plan
+from hookbundles import MANIFEST_NAME, install, selection, values
 from tests import fixtures
-from tests.fixtures import ENV_DIR, REV, RUFF, SEED_DIR, Tar, marker
+from tests.fixtures import ENV_DIR, REV, RUFF, SEED_DIR, Tar
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -41,23 +40,8 @@ class _Case(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
-        self.home = root / "store"
-        self.out = root / "out"
-        self.blobs = self.out / "blobs"
-        home = str(self.home)
-        work = root / "work"
-        fixtures.base(work, home)
-        unit = fixtures.unit()
-        tar = Tar(work / "units" / f"{unit.uid}.tar").directory("hooks")
-        content = marker(ENV_DIR, home=home)
-        _ = fixtures.environment(tar, ENV_DIR, content, home).close()
-        self.index = assemble.assemble(
-            fixtures.settings(home),
-            Plan(units=(unit,), notes=(), surveyed=0),
-            fixtures.built(unit),
-            work,
-            assemble.Writer(self.blobs, home, 0),
-        )
+        self.index, self.blobs, self.home = fixtures.bundle(root)
+        self.out = self.blobs.parent
         self.names = selection.everything(self.index)
 
     def runner(self, **changes: str) -> install.Runner:
